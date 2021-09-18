@@ -1,31 +1,25 @@
 
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::serde_json::json;
-use near_sdk::{AccountId, env, near_bindgen, setup_alloc};
+use near_sdk::serde_json::{json, from_slice};
+use near_sdk::{AccountId, Balance, PromiseOrValue, env, near_bindgen, setup_alloc};
 use near_sdk::collections::{LookupMap, UnorderedMap};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use near_sdk::serde::{Serialize, Deserialize};
-use near_sdk::{BlockHeight, Gas, PanicOnDefault, Promise};
-use near_sdk::json_types::{U128, U64};
+use near_sdk::{BlockHeight, Gas, PanicOnDefault, Promise, PromiseResult};
+use near_sdk::json_types::{U128, U64, ValidAccountId};
+use near_contract_standards::fungible_token::metadata::{FungibleTokenMetadata};
+use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
 
 setup_alloc!();
 
 #[near_bindgen]
 #[derive(PanicOnDefault, BorshDeserialize, BorshSerialize)]
 pub struct Airdrop {
-    tokens: UnorderedMap<AccountId, Token>,
+    tokens: UnorderedMap<AccountId, FungibleTokenMetadata>,
     records: Vec<Record>,
     tasks: HashMap<AccountId, Vec<Task>>,
     
-}
-
-#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
-#[serde(crate = "near_sdk::serde")]
-#[derive(Debug)]
-pub struct Token {
-    address: AccountId,
-    symbol: String
 }
 
 #[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
@@ -42,7 +36,8 @@ pub struct Record {
 #[serde(crate = "near_sdk::serde")]
 #[derive(Debug)]
 pub struct Task {
-    total_num: u32,
+    creator: AccountId,
+    total_count: u32,
     amount_per_account: U128,
     token: AccountId,
     index: u32,
@@ -61,18 +56,78 @@ impl Airdrop {
         }
     }
 
-    pub fn get_token_list(&self) -> Vec<Token> {
+    pub fn get_token_list(&self) -> Vec<FungibleTokenMetadata> {
         self.tokens.values().collect()
     }
 
     pub fn add_token(&mut self, address: AccountId) {
-        assert!(self.tokens.get(&address.clone()).is_none(), "token already exist");
-        let promise = env::promise_create(address, b"ft_metadata", &json!("{}").to_string().as_bytes(), 0, 0);
+        assert!(self.tokens.get(&address.clone()).is_none(), "token already exist.");
+        let promise = env::promise_create(address.clone(), b"ft_metadata", &json!("{}").to_string().as_bytes(), 0, 0);
         let metadata = match env::promise_result(promise) {
-            Successful(v) => {
-                
+            PromiseResult::Successful(v) => v,
+            _ => panic!("Get metadata failed."),
+        };
+        let metadata: FungibleTokenMetadata = from_slice(&metadata).unwrap();
+        self.tokens.insert(&address, &metadata);
+    }
+
+    #[payable]
+    pub fn add_task(&mut self, total_count: u32, amount_per_account: U128, token: AccountId, deposit_near:U128) {
+        let total_amount = total_count as u128 * u128::from(amount_per_account);
+    }
+}
+
+#[near_bindgen]
+#[allow(unreachable_code)]
+impl FungibleTokenReceiver for Airdrop {
+    /// Callback on receiving tokens by this contract.
+    /// `msg` format is either "" for deposit or `TokenReceiverMessage`.
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        let token_in = env::predecessor_account_id();
+        if msg.is_empty() {
+            // Simple deposit.
+            self.internal_deposit(sender_id.as_ref(), &token_in, amount.into());
+            PromiseOrValue::Value(U128(0))
+        } else {
+            // [AUDIT14] shutdown instant swap from interface
+            env::panic(b"Instant Swap Feature Not Open Yet");
+
+            let message =
+                serde_json::from_str::<TokenReceiverMessage>(&msg).expect("ERR_MSG_WRONG_FORMAT");
+            match message {
+                TokenReceiverMessage::Execute {
+                    referral_id,
+                    force,
+                    actions,
+                } => {
+                    let referral_id = referral_id.map(|x| x.to_string());
+                    let out_amounts = self.internal_direct_actions(
+                        token_in,
+                        amount.0,
+                        sender_id.as_ref(),
+                        force != 0,
+                        referral_id,
+                        &actions,
+                    );
+                    for (token_out, amount_out) in out_amounts.into_iter() {
+                        self.internal_send_tokens(sender_id.as_ref(), &token_out, amount_out);
+                    }
+                    // Even if send tokens fails, we don't return funds back to sender.
+                    PromiseOrValue::Value(U128(0))
+                }
             }
         }
+    }
+}
+
+
+impl Airdrop {
+    pub(crate) fn internal_deposit(&mut self, token: AccountId, amount: Balance, sender: AccountId) {
         
     }
 }
